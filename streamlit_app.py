@@ -7,7 +7,7 @@ from typing import List, Tuple
 from PIL import Image, ImageDraw
 import numpy as np
 import streamlit as st
-from streamlit_drawable_canvas import st_canvas
+from streamlit_cropper import st_cropper  # <-- fallback component
 
 # ---------------- Data structures ----------------
 @dataclass
@@ -98,8 +98,6 @@ with st.sidebar:
     csv_file = st.file_uploader("Upload CSV of points", type=["csv"])
     normalized = st.checkbox("Points are normalized (0..1)", value=False)
     show_grid = st.checkbox("Show grid overlay", value=True)
-    stroke_width = st.slider("Rectangle stroke width", 2, 12, 4)
-    drawing_mode = st.selectbox("Drawing mode", ["rect", "transform"], help="If blank, try 'transform' once.")
     st.caption("Headers like `x,y`, `cx,cy`, or `left,top` are detected; otherwise first two columns are used.")
 
 if img_file is None or csv_file is None:
@@ -108,81 +106,50 @@ if img_file is None or csv_file is None:
 
 # Load image & points
 base_img = Image.open(img_file).convert("RGBA")
-w, h = base_img.size
+img_w, img_h = base_img.size
 points = parse_csv_points(csv_file)
 
 # Downscale very large images (perf)
-if w * h > 12_000_000:  # ~12 MP
-    scale = (12_000_000 / (w * h)) ** 0.5
-    base_img = base_img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
-    w, h = base_img.size
+if img_w * img_h > 12_000_000:
+    scale = (12_000_000 / (img_w * img_h)) ** 0.5
+    base_img = base_img.resize((max(1, int(img_w * scale)), max(1, int(img_h * scale))), Image.LANCZOS)
+    img_w, img_h = base_img.size
 
-# Build background with dots (+ optional grid)
+# Build background with dots (+ optional grid) and convert to RGB for cropper
 bg_img = draw_points_on_image(base_img, points, normalized=normalized)
 if show_grid:
     bg_img = add_grid_overlay(bg_img)
-
-# Convert to RGB (no alpha) for canvas and resize to canvas size
-bg_img_rgb = bg_img.convert("RGB")
-
-# Canvas size (preserve aspect)
-MAX_W, MAX_H = 1200, 900
-scale = min(MAX_W / w, MAX_H / h, 1.0)
-canvas_w = max(1, int(w * scale))
-canvas_h = max(1, int(h * scale))
-
-# IMPORTANT: st_canvas expects a PIL.Image or array, but truthiness check fails on arrays.
-# We pass a PIL.Image that exactly matches the canvas size.
-bg_resized = bg_img_rgb.resize((canvas_w, canvas_h), Image.BILINEAR)
-
-# Debug preview (what we pass to st_canvas)
-with st.expander("🔧 Debug"):
-    st.write({"image_w": w, "image_h": h, "canvas_w": canvas_w, "canvas_h": canvas_h})
-    st.image(bg_resized, caption="Background preview (exact image passed to canvas)")
+bg_rgb = bg_img.convert("RGB")
 
 st.subheader("Draw a rectangle")
-canvas_result = st_canvas(
-    fill_color="rgba(255,0,0,0.25)",   # visible semi-transparent red
-    stroke_width=stroke_width,
-    stroke_color="#ff0000",
-    background_image=bg_resized,       # <-- PIL.Image (RGB), sized to canvas
-    background_color="#FFFFFF",
-    update_streamlit=True,
-    width=canvas_w,
-    height=canvas_h,
-    drawing_mode=drawing_mode,         # "rect" or "transform"
-    display_toolbar=True,
-    key=f"canvas_{w}x{h}_{drawing_mode}",
+# st_cropper shows the image and lets you draw/move/resize a rectangle.
+# It returns the cropped PIL image AND the bbox (in displayed image coordinates).
+crop, bbox = st_cropper(
+    bg_rgb,
+    realtime_update=True,
+    box_color='#00aaff',
+    aspect_ratio=None,         # free-form rectangle
+    return_type='both',
+    key="cropper"
 )
 
-# Collect rectangles
-rects: List[Rect] = []
-if canvas_result.json_data is not None:
-    for obj in canvas_result.json_data.get("objects", []):
-        if obj.get("type") == "rect":
-            left = float(obj.get("left", 0.0))
-            top = float(obj.get("top", 0.0))
-            w_obj = float(obj.get("width", 0.0)) * float(obj.get("scaleX", 1.0))
-            h_obj = float(obj.get("height", 0.0)) * float(obj.get("scaleY", 1.0))
-            rects.append(Rect.from_points((left, top), (left + w_obj, top + h_obj)))
+# bbox contains left, top, width, height in the displayed image space (same as bg_rgb).
+left = float(bbox['left'])
+top = float(bbox['top'])
+width = float(bbox['width'])
+height = float(bbox['height'])
+rect = Rect.from_points((left, top), (left+width, top+height))
 
-if not rects:
-    st.warning("Draw a rectangle (or switch to 'transform' to sanity-check rendering).")
-    st.stop()
-
-current_rect = rects[-1]
-
-# Map rect back to original image pixels
-scale_x = w / canvas_w
-scale_y = h / canvas_h
+# Map directly to original bg_rgb pixels (cropper didn’t scale; it shows bg_rgb as provided)
+w, h = bg_rgb.size
 mapped_rect = Rect(
-    minX=current_rect.minX * scale_x,
-    minY=current_rect.minY * scale_y,
-    maxX=current_rect.maxX * scale_x,
-    maxY=current_rect.maxY * scale_y,
+    minX=rect.minX,
+    minY=rect.minY,
+    maxX=rect.maxX,
+    maxY=rect.maxY
 )
 
-# Stats
+# Compute stats
 count = count_in_rect(points, mapped_rect, w, h, normalized=normalized)
 rect_w = mapped_rect.maxX - mapped_rect.minX
 rect_h = mapped_rect.maxY - mapped_rect.minY
@@ -204,7 +171,7 @@ st.caption(
     f"Hit rate: {pct:.2f}%"
 )
 
-# Download CSV (selection + stats)
+# ---------------- Download CSV (selection + stats) ----------------
 def build_stats_csv_bytes() -> bytes:
     output = io.StringIO()
     writer = csv.writer(output)
