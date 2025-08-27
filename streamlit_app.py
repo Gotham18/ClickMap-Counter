@@ -53,7 +53,7 @@ def parse_csv_points(uploaded) -> List[Point]:
         if len(r) < 2: continue
         try:
             pts.append(Point(float(r[ax]), float(r[ay])))
-        except:  # skip bad rows
+        except:
             pass
     return pts
 
@@ -65,8 +65,7 @@ def draw_points_on_image(base_img: Image.Image, points: List[Point], normalized:
     for p in points:
         x = p.x * w if normalized else p.x
         y = p.y * h if normalized else p.y
-        bbox = [(x - radius, y - radius), (x + radius, y + radius)]
-        draw.ellipse(bbox, fill=(0, 0, 0, 210))
+        draw.ellipse([(x - radius, y - radius), (x + radius, y + radius)], fill=(0, 0, 0, 210))
     return img
 
 def add_grid_overlay(img: Image.Image, step_hint: int=20) -> Image.Image:
@@ -74,8 +73,10 @@ def add_grid_overlay(img: Image.Image, step_hint: int=20) -> Image.Image:
     grid = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     g = ImageDraw.Draw(grid)
     step = max(50, min(w, h) // step_hint)
-    for x in range(0, w, step): g.line([(x, 0), (x, h)], fill=(0, 0, 0, 40), width=1)
-    for y in range(0, h, step): g.line([(0, y), (w, y)], fill=(0, 0, 0, 40), width=1)
+    for x in range(0, w, step):
+        g.line([(x, 0), (x, h)], fill=(0, 0, 0, 40), width=1)
+    for y in range(0, h, step):
+        g.line([(0, y), (w, y)], fill=(0, 0, 0, 40), width=1)
     return Image.alpha_composite(img, grid)
 
 def count_in_rect(points: List[Point], rect: Rect, img_w: int, img_h: int, normalized: bool=False) -> int:
@@ -100,6 +101,9 @@ with st.sidebar:
     normalized = st.checkbox("Points are normalized (0..1)", value=False)
     show_grid = st.checkbox("Show grid overlay", value=True)
     stroke_width = st.slider("Rectangle stroke width", 2, 12, 4)
+    drawing_mode = st.selectbox("Drawing mode", ["rect", "transform"], help="If blank, try 'transform' once.")
+    force_resize_bg = st.checkbox("Force-resize background to canvas size", value=True,
+                                  help="If the canvas is blank, turn this ON.")
     st.caption("CSV headers like `x,y`, `cx,cy`, or `left,top` are detected; otherwise first two columns are used.")
 
 if img_file is None or csv_file is None:
@@ -111,38 +115,48 @@ base_img = Image.open(img_file).convert("RGBA")
 w, h = base_img.size
 points = parse_csv_points(csv_file)
 
-# Downscale very large images (perf)
+# Optional downscale for very large images
 if w * h > 12_000_000:  # ~12 MP
     scale = (12_000_000 / (w * h)) ** 0.5
     base_img = base_img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
     w, h = base_img.size
 
-# Render overlay
+# Pre-render points and (optional) grid
 bg_img = draw_points_on_image(base_img, points, normalized=normalized)
 if show_grid:
     bg_img = add_grid_overlay(bg_img)
 
-# ---- Important: pass a PIL.Image (RGB), not a NumPy array ----
+# Convert to RGB (no alpha) for canvas
 bg_img_rgb = bg_img.convert("RGB")
 
-# Canvas size preserving aspect ratio
+# Compute canvas size preserving aspect ratio
 MAX_W, MAX_H = 1200, 900
 scale = min(MAX_W / w, MAX_H / h, 1.0)
 canvas_w = max(1, int(w * scale))
 canvas_h = max(1, int(h * scale))
+
+# Optionally force background to exactly match canvas size (fixes some blank cases)
+bg_for_canvas = bg_img_rgb.resize((canvas_w, canvas_h), Image.BILINEAR) if force_resize_bg else bg_img_rgb
+
+# ---- Debug panel to verify what Streamlit sees ----
+with st.expander("🔧 Debug"):
+    st.write({"image_w": w, "image_h": h, "canvas_w": canvas_w, "canvas_h": canvas_h,
+              "force_resize_bg": force_resize_bg, "drawing_mode": drawing_mode})
+    st.image(bg_for_canvas, caption="Background preview (what the canvas receives)")
 
 st.subheader("Draw a rectangle over the image")
 canvas_result = st_canvas(
     fill_color="rgba(0,0,0,0)",
     stroke_width=stroke_width,
     stroke_color="#000000",
-    background_image=bg_img_rgb,     # <— PIL Image (truthy, no ambiguous bool)
-    background_color=None,
+    background_image=bg_for_canvas,   # PIL.Image in RGB, sized to canvas if forced
+    background_color="#FFFFFF",       # solid white background
     update_streamlit=True,
     width=canvas_w,
     height=canvas_h,
-    drawing_mode="rect",
-    key=f"canvas_{w}x{h}",
+    drawing_mode=drawing_mode,
+    display_toolbar=True,
+    key=f"canvas_{w}x{h}_{int(force_resize_bg)}_{drawing_mode}",
 )
 
 # Collect rectangles
@@ -157,12 +171,12 @@ if canvas_result.json_data is not None:
             rects.append(Rect.from_points((left, top), (left + w_obj, top + h_obj)))
 
 if not rects:
-    st.warning("Draw a rectangle to see selection details and stats.")
+    st.warning("Draw a rectangle (or switch to 'transform' to sanity-check rendering).")
     st.stop()
 
 current_rect = rects[-1]
 
-# Map back to original image pixels
+# Map back to original image pixels (account for scaling)
 scale_x = w / canvas_w
 scale_y = h / canvas_h
 mapped_rect = Rect(
