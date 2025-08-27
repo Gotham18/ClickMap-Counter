@@ -4,8 +4,8 @@ import csv
 from dataclasses import dataclass
 from typing import List, Tuple
 
-import numpy as np
 from PIL import Image, ImageDraw
+import numpy as np
 import streamlit as st
 from streamlit_drawable_canvas import st_canvas
 
@@ -25,6 +25,7 @@ class Rect:
 
 # ---------------- Utilities ----------------
 def parse_csv_points(uploaded) -> List[Point]:
+    """Parse CSV with X/Y columns; supports headers x,y / cx,cy / left,top; else uses first two cols."""
     text = uploaded.getvalue().decode("utf-8-sig")
     rows = list(csv.reader(text.splitlines()))
     pts: List[Point] = []
@@ -46,8 +47,7 @@ def parse_csv_points(uploaded) -> List[Point]:
         ax, ay = 0, 1
 
     for r in data:
-        if len(r) < 2:
-            continue
+        if len(r) < 2: continue
         try:
             pts.append(Point(float(r[ax]), float(r[ay])))
         except:
@@ -55,6 +55,7 @@ def parse_csv_points(uploaded) -> List[Point]:
     return pts
 
 def draw_points_on_image(base_img: Image.Image, points: List[Point], normalized: bool=False) -> Image.Image:
+    """Return base_img with points drawn as small dots."""
     img = base_img.copy().convert("RGBA")
     w, h = img.size
     draw = ImageDraw.Draw(img)
@@ -66,6 +67,7 @@ def draw_points_on_image(base_img: Image.Image, points: List[Point], normalized:
     return img
 
 def add_grid_overlay(img: Image.Image, step_hint: int=20) -> Image.Image:
+    """Light grid overlay for alignment."""
     w, h = img.size
     grid = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     g = ImageDraw.Draw(grid)
@@ -77,6 +79,7 @@ def add_grid_overlay(img: Image.Image, step_hint: int=20) -> Image.Image:
     return Image.alpha_composite(img, grid)
 
 def count_in_rect(points: List[Point], rect: Rect, img_w: int, img_h: int, normalized: bool=False) -> int:
+    """Count points inside rect (inclusive)."""
     c = 0
     for p in points:
         x = p.x * img_w if normalized else p.x
@@ -97,8 +100,7 @@ with st.sidebar:
     show_grid = st.checkbox("Show grid overlay", value=True)
     stroke_width = st.slider("Rectangle stroke width", 2, 12, 4)
     drawing_mode = st.selectbox("Drawing mode", ["rect", "transform"], help="If blank, try 'transform' once.")
-    diag_no_bg = st.checkbox("Diagnostic: no background (should always show rectangles)", value=False)
-    st.caption("If you see rectangles but not the image, Diagnostic mode helps isolate the issue.")
+    st.caption("Headers like `x,y`, `cx,cy`, or `left,top` are detected; otherwise first two columns are used.")
 
 if img_file is None or csv_file is None:
     st.info("Upload an image and a CSV to begin.")
@@ -110,21 +112,17 @@ w, h = base_img.size
 points = parse_csv_points(csv_file)
 
 # Downscale very large images (perf)
-if w * h > 12_000_000:
+if w * h > 12_000_000:  # ~12 MP
     scale = (12_000_000 / (w * h)) ** 0.5
     base_img = base_img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
     w, h = base_img.size
 
-# Build background image (unless diagnostic)
-if not diag_no_bg:
-    bg_img = draw_points_on_image(base_img, points, normalized=normalized)
-    if show_grid:
-        bg_img = add_grid_overlay(bg_img)
-else:
-    # Plain white background to prove overlay works
-    bg_img = Image.new("RGBA", (w, h), (255, 255, 255, 255))
+# Build background with dots (+ optional grid)
+bg_img = draw_points_on_image(base_img, points, normalized=normalized)
+if show_grid:
+    bg_img = add_grid_overlay(bg_img)
 
-# Convert to RGB (no alpha) before handing to canvas
+# Convert to RGB (no alpha) for canvas and resize to canvas size
 bg_img_rgb = bg_img.convert("RGB")
 
 # Canvas size (preserve aspect)
@@ -133,33 +131,28 @@ scale = min(MAX_W / w, MAX_H / h, 1.0)
 canvas_w = max(1, int(w * scale))
 canvas_h = max(1, int(h * scale))
 
-# ---------- CRITICAL FIX ----------
-# st_canvas needs a NumPy array (H, W, 3 or 4) with dtype=uint8 that matches the canvas size.
+# IMPORTANT: st_canvas expects a PIL.Image or array, but truthiness check fails on arrays.
+# We pass a PIL.Image that exactly matches the canvas size.
 bg_resized = bg_img_rgb.resize((canvas_w, canvas_h), Image.BILINEAR)
-bg_array = np.array(bg_resized, dtype=np.uint8)  # shape: (H, W, 3)
 
+# Debug preview (what we pass to st_canvas)
 with st.expander("🔧 Debug"):
-    st.write({
-        "image_w": w, "image_h": h,
-        "canvas_w": canvas_w, "canvas_h": canvas_h,
-        "bg_array_shape": tuple(bg_array.shape),
-        "drawing_mode": drawing_mode, "diag_no_bg": diag_no_bg
-    })
-    st.image(bg_resized, caption="Background preview (exact array passed to canvas)")
+    st.write({"image_w": w, "image_h": h, "canvas_w": canvas_w, "canvas_h": canvas_h})
+    st.image(bg_resized, caption="Background preview (exact image passed to canvas)")
 
 st.subheader("Draw a rectangle")
 canvas_result = st_canvas(
-    fill_color="rgba(255,0,0,0.25)",   # visible red fill
+    fill_color="rgba(255,0,0,0.25)",   # visible semi-transparent red
     stroke_width=stroke_width,
     stroke_color="#ff0000",
-    background_image=bg_array,         # <-- NumPy uint8 array, sized to canvas
+    background_image=bg_resized,       # <-- PIL.Image (RGB), sized to canvas
     background_color="#FFFFFF",
     update_streamlit=True,
     width=canvas_w,
     height=canvas_h,
-    drawing_mode=drawing_mode,
+    drawing_mode=drawing_mode,         # "rect" or "transform"
     display_toolbar=True,
-    key=f"canvas_{w}x{h}_{drawing_mode}_{int(diag_no_bg)}",
+    key=f"canvas_{w}x{h}_{drawing_mode}",
 )
 
 # Collect rectangles
@@ -211,7 +204,7 @@ st.caption(
     f"Hit rate: {pct:.2f}%"
 )
 
-# Download CSV
+# Download CSV (selection + stats)
 def build_stats_csv_bytes() -> bytes:
     output = io.StringIO()
     writer = csv.writer(output)
