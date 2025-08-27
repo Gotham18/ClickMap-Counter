@@ -1,14 +1,17 @@
+# streamlit_app.py
 import io
 import csv
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
 import streamlit as st
 from streamlit_drawable_canvas import st_canvas
 
-# ---------- Data structures ----------
+# =========================
+# Data structures
+# =========================
 @dataclass
 class Point:
     x: float
@@ -17,16 +20,20 @@ class Point:
 @dataclass
 class Rect:
     minX: float; minY: float; maxX: float; maxY: float
-
     @staticmethod
     def from_points(a: Tuple[float, float], b: Tuple[float, float]) -> "Rect":
         (x1, y1), (x2, y2) = a, b
         return Rect(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
 
-# ---------- CSV parsing ----------
-def parse_csv_points(file) -> List[Point]:
-    """Parses a CSV with at least two columns for X/Y. Tries header-based detection, else uses first two columns."""
-    text = file.getvalue().decode("utf-8-sig")
+# =========================
+# Utilities
+# =========================
+def parse_csv_points(uploaded) -> List[Point]:
+    """
+    Parses a CSV with at least two columns for X/Y.
+    Tries header-based detection (x/cx/lx/left, y/cy/ly/top), else first two columns.
+    """
+    text = uploaded.getvalue().decode("utf-8-sig")
     rows = list(csv.reader(text.splitlines()))
     pts: List[Point] = []
     if not rows:
@@ -39,10 +46,8 @@ def parse_csv_points(file) -> List[Point]:
 
     if len(header) >= 2 and (set(header) & hx or set(header) & hy):
         for i, h in enumerate(header):
-            if ax is None and h in hx:
-                ax = i
-            if ay is None and h in hy:
-                ay = i
+            if ax is None and h in hx: ax = i
+            if ay is None and h in hy: ay = i
         if ax is None or ay is None:
             ax, ay = 0, 1
     else:
@@ -58,25 +63,34 @@ def parse_csv_points(file) -> List[Point]:
             pass
     return pts
 
-# ---------- Drawing helpers ----------
 def draw_points_on_image(base_img: Image.Image, points: List[Point], normalized: bool=False) -> Image.Image:
-    """Returns a copy of base_img with points drawn as small circles."""
+    """Return an image with points drawn as small circles."""
     img = base_img.copy().convert("RGBA")
     w, h = img.size
     draw = ImageDraw.Draw(img)
-    radius = max(2, int(0.006 * max(w, h)))  # scale dot size with image size
+    radius = max(2, int(0.006 * max(w, h)))  # appearance scaling
 
     for p in points:
         x = p.x * w if normalized else p.x
         y = p.y * h if normalized else p.y
-        # small filled circle
         bbox = [(x - radius, y - radius), (x + radius, y + radius)]
-        draw.ellipse(bbox, fill=(0, 0, 0, 200))  # dark dot
-
+        draw.ellipse(bbox, fill=(0, 0, 0, 210))
     return img
 
+def add_grid_overlay(img: Image.Image, step_hint: int=20) -> Image.Image:
+    """Add a light grid overlay to assist with alignment."""
+    w, h = img.size
+    grid = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    g = ImageDraw.Draw(grid)
+    step = max(50, min(w, h) // step_hint)
+    for x in range(0, w, step):
+        g.line([(x, 0), (x, h)], fill=(0, 0, 0, 40), width=1)
+    for y in range(0, h, step):
+        g.line([(0, y), (w, y)], fill=(0, 0, 0, 40), width=1)
+    return Image.alpha_composite(img, grid)
+
 def count_in_rect(points: List[Point], rect: Rect, img_w: int, img_h: int, normalized: bool=False) -> int:
-    """Counts points within the rectangle (inclusive)."""
+    """Counts points within the rectangle (inclusive bounds)."""
     c = 0
     for p in points:
         x = p.x * img_w if normalized else p.x
@@ -85,8 +99,10 @@ def count_in_rect(points: List[Point], rect: Rect, img_w: int, img_h: int, norma
             c += 1
     return c
 
-# ---------- UI ----------
-st.set_page_config(page_title="Click Counter (Streamlit)", layout="wide")
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="Image Region Click Counter", layout="wide")
 st.title("Image Region Click Counter")
 
 with st.sidebar:
@@ -94,90 +110,128 @@ with st.sidebar:
     img_file = st.file_uploader("Upload image", type=["png", "jpg", "jpeg", "webp"])
     csv_file = st.file_uploader("Upload CSV of points", type=["csv"])
     normalized = st.checkbox("Points are normalized (0..1)", value=False)
-    show_grid = st.checkbox("Show light grid overlay", value=True)
+    show_grid = st.checkbox("Show grid overlay", value=True)
     stroke_width = st.slider("Rectangle stroke width", 2, 12, 4)
-    instructions = st.expander("CSV format tips")
-    with instructions:
-        st.markdown(
-            "- Works with headers like `x,y`, `cx,cy`, `left,top`, etc., or just the first two columns.\n"
-            "- If normalized is on, points are treated as fractions of width/height."
-        )
+    st.caption("CSV headers like `x,y`, `cx,cy`, or `left,top` are detected; otherwise first two columns are used.")
 
 if img_file is None or csv_file is None:
-    st.info("Upload an image and a CSV in the sidebar to begin.")
+    st.info("Upload an image and a CSV to begin.")
     st.stop()
 
 # Load image & points
 base_img = Image.open(img_file).convert("RGBA")
-points = parse_csv_points(csv_file)
 w, h = base_img.size
+points = parse_csv_points(csv_file)
 
-# Pre-render points on the image so users can draw a selection over them
+# Optional downscale for very large images (performance)
+if w * h > 12_000_000:  # ~12 MP
+    scale = (12_000_000 / (w * h)) ** 0.5
+    base_img = base_img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+    w, h = base_img.size
+
+# Pre-render points and (optional) grid
 bg_img = draw_points_on_image(base_img, points, normalized=normalized)
-
-# Optional subtle grid overlay
 if show_grid:
-    grid = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    gdraw = ImageDraw.Draw(grid)
-    step = max(50, min(w, h) // 20)
-    for x in range(0, w, step):
-        gdraw.line([(x, 0), (x, h)], fill=(0, 0, 0, 40), width=1)
-    for y in range(0, h, step):
-        gdraw.line([(0, y), (w, y)], fill=(0, 0, 0, 40), width=1)
-    bg_img = Image.alpha_composite(bg_img, grid)
+    bg_img = add_grid_overlay(bg_img)
+
+# ==== Blank-canvas fix ====
+bg_np = np.array(bg_img.convert("RGB"))
+
+# Compute canvas size that preserves aspect ratio and fits typical screens
+MAX_W = 1200
+MAX_H = 900
+scale = min(MAX_W / w, MAX_H / h, 1.0)
+canvas_w = max(1, int(w * scale))
+canvas_h = max(1, int(h * scale))
 
 st.subheader("Draw a rectangle over the image")
 canvas_result = st_canvas(
-    fill_color="rgba(0, 0, 0, 0)",
+    fill_color="rgba(0,0,0,0)",
     stroke_width=stroke_width,
     stroke_color="#000000",
-    background_image=bg_img,
+    background_image=bg_np,
+    background_color=None,
     update_streamlit=True,
-    height=min(900, int(h * min(1.0, 1200 / max(1, w)))),  # scale down super large images for UX
-    width=min(1200, w),
+    width=canvas_w,
+    height=canvas_h,
     drawing_mode="rect",
-    key="canvas",
+    key=f"canvas_{w}x{h}",  # forces rerender if image size changes
 )
 
-# Interpret latest rectangle (if any)
-rect_display = st.empty()
-metrics = st.empty()
-
-rects = []
+# Recover the last rectangle the user drew
+rects: List[Rect] = []
 if canvas_result.json_data is not None:
     for obj in canvas_result.json_data.get("objects", []):
         if obj.get("type") == "rect":
             left = float(obj.get("left", 0.0))
             top = float(obj.get("top", 0.0))
-            width_obj = float(obj.get("width", 0.0)) * float(obj.get("scaleX", 1.0))
-            height_obj = float(obj.get("height", 0.0)) * float(obj.get("scaleY", 1.0))
-            r = Rect.from_points((left, top), (left + width_obj, top + height_obj))
-            rects.append(r)
+            w_obj = float(obj.get("width", 0.0)) * float(obj.get("scaleX", 1.0))
+            h_obj = float(obj.get("height", 0.0)) * float(obj.get("scaleY", 1.0))
+            rects.append(Rect.from_points((left, top), (left + w_obj, top + h_obj)))
 
 if not rects:
-    st.warning("Draw a rectangle to see the selection details and count.")
+    st.warning("Draw a rectangle to see selection details and stats.")
     st.stop()
 
 current_rect = rects[-1]
-count = count_in_rect(points, current_rect, w, h, normalized=normalized)
 
+# Map rectangle back to original image pixels (canvas may be scaled)
+scale_x = w / canvas_w
+scale_y = h / canvas_h
+mapped_rect = Rect(
+    minX=current_rect.minX * scale_x,
+    minY=current_rect.minY * scale_y,
+    maxX=current_rect.maxX * scale_x,
+    maxY=current_rect.maxY * scale_y,
+)
+
+# Compute stats
+count = count_in_rect(points, mapped_rect, w, h, normalized=normalized)
+rect_w = mapped_rect.maxX - mapped_rect.minX
+rect_h = mapped_rect.maxY - mapped_rect.minY
+pct = (count / max(1, len(points))) * 100
+area_pct = (rect_w * rect_h) / (w * h) * 100
+
+# Display results
 col1, col2 = st.columns(2)
 with col1:
     st.markdown(
-        f"**Rect (px):** ({current_rect.minX:.0f}, {current_rect.minY:.0f}) → "
-        f"({current_rect.maxX:.0f}, {current_rect.maxY:.0f})"
+        f"**Rect (px):** ({mapped_rect.minX:.0f}, {mapped_rect.minY:.0f}) → "
+        f"({mapped_rect.maxX:.0f}, {mapped_rect.maxY:.0f})"
     )
 with col2:
     st.markdown(f"**Clicks in region:** **{count}** / {len(points)}")
-
-# Also show percent and area
-rect_w = current_rect.maxX - current_rect.minX
-rect_h = current_rect.maxY - current_rect.minY
-pct = (count / max(1, len(points))) * 100
-area_pct = (rect_w * rect_h) / (w * h) * 100
 
 st.caption(
     f"Width×Height: {rect_w:.0f}×{rect_h:.0f} px · "
     f"Area: {area_pct:.2f}% of image · "
     f"Hit rate: {pct:.2f}%"
 )
+
+# =========================
+# Download: selection & stats CSV
+# =========================
+def build_stats_csv_bytes() -> bytes:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "image_width_px","image_height_px","points_normalized",
+        "rect_minX_px","rect_minY_px","rect_maxX_px","rect_maxY_px",
+        "rect_width_px","rect_height_px",
+        "area_pct_of_image","clicks_in_region","total_clicks","hit_rate_pct"
+    ])
+    writer.writerow([
+        w, h, normalized,
+        int(mapped_rect.minX), int(mapped_rect.minY), int(mapped_rect.maxX), int(mapped_rect.maxY),
+        int(rect_w), int(rect_h),
+        f"{area_pct:.4f}", count, len(points), f"{pct:.4f}"
+    ])
+    return output.getvalue().encode("utf-8")
+
+st.download_button(
+    label="⬇️ Download selection stats (CSV)",
+    data=build_stats_csv_bytes(),
+    file_name="selection_stats.csv",
+    mime="text/csv",
+)
+
