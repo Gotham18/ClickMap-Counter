@@ -9,9 +9,7 @@ from PIL import Image, ImageDraw
 import streamlit as st
 from streamlit_drawable_canvas import st_canvas
 
-# =========================
-# Data structures
-# =========================
+# ---------------- Data structures ----------------
 @dataclass
 class Point:
     x: float
@@ -25,9 +23,7 @@ class Rect:
         (x1, y1), (x2, y2) = a, b
         return Rect(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
 
-# =========================
-# Utilities
-# =========================
+# ---------------- Utilities ----------------
 def parse_csv_points(uploaded) -> List[Point]:
     text = uploaded.getvalue().decode("utf-8-sig")
     rows = list(csv.reader(text.splitlines()))
@@ -50,7 +46,8 @@ def parse_csv_points(uploaded) -> List[Point]:
         ax, ay = 0, 1
 
     for r in data:
-        if len(r) < 2: continue
+        if len(r) < 2:
+            continue
         try:
             pts.append(Point(float(r[ax]), float(r[ay])))
         except:
@@ -88,9 +85,7 @@ def count_in_rect(points: List[Point], rect: Rect, img_w: int, img_h: int, norma
             c += 1
     return c
 
-# =========================
-# Streamlit UI
-# =========================
+# ---------------- UI ----------------
 st.set_page_config(page_title="Image Region Click Counter", layout="wide")
 st.title("Image Region Click Counter")
 
@@ -102,9 +97,8 @@ with st.sidebar:
     show_grid = st.checkbox("Show grid overlay", value=True)
     stroke_width = st.slider("Rectangle stroke width", 2, 12, 4)
     drawing_mode = st.selectbox("Drawing mode", ["rect", "transform"], help="If blank, try 'transform' once.")
-    force_resize_bg = st.checkbox("Force-resize background to canvas size", value=True,
-                                  help="If the canvas is blank, turn this ON.")
-    st.caption("CSV headers like `x,y`, `cx,cy`, or `left,top` are detected; otherwise first two columns are used.")
+    diag_no_bg = st.checkbox("Diagnostic: no background (should always show rectangles)", value=False)
+    st.caption("If you see rectangles but not the image, Diagnostic mode helps isolate the issue.")
 
 if img_file is None or csv_file is None:
     st.info("Upload an image and a CSV to begin.")
@@ -115,48 +109,57 @@ base_img = Image.open(img_file).convert("RGBA")
 w, h = base_img.size
 points = parse_csv_points(csv_file)
 
-# Optional downscale for very large images
-if w * h > 12_000_000:  # ~12 MP
+# Downscale very large images (perf)
+if w * h > 12_000_000:
     scale = (12_000_000 / (w * h)) ** 0.5
     base_img = base_img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
     w, h = base_img.size
 
-# Pre-render points and (optional) grid
-bg_img = draw_points_on_image(base_img, points, normalized=normalized)
-if show_grid:
-    bg_img = add_grid_overlay(bg_img)
+# Build background image (unless diagnostic)
+if not diag_no_bg:
+    bg_img = draw_points_on_image(base_img, points, normalized=normalized)
+    if show_grid:
+        bg_img = add_grid_overlay(bg_img)
+else:
+    # Plain white background to prove overlay works
+    bg_img = Image.new("RGBA", (w, h), (255, 255, 255, 255))
 
-# Convert to RGB (no alpha) for canvas
+# Convert to RGB (no alpha) before handing to canvas
 bg_img_rgb = bg_img.convert("RGB")
 
-# Compute canvas size preserving aspect ratio
+# Canvas size (preserve aspect)
 MAX_W, MAX_H = 1200, 900
 scale = min(MAX_W / w, MAX_H / h, 1.0)
 canvas_w = max(1, int(w * scale))
 canvas_h = max(1, int(h * scale))
 
-# Optionally force background to exactly match canvas size (fixes some blank cases)
-bg_for_canvas = bg_img_rgb.resize((canvas_w, canvas_h), Image.BILINEAR) if force_resize_bg else bg_img_rgb
+# ---------- CRITICAL FIX ----------
+# st_canvas needs a NumPy array (H, W, 3 or 4) with dtype=uint8 that matches the canvas size.
+bg_resized = bg_img_rgb.resize((canvas_w, canvas_h), Image.BILINEAR)
+bg_array = np.array(bg_resized, dtype=np.uint8)  # shape: (H, W, 3)
 
-# ---- Debug panel to verify what Streamlit sees ----
 with st.expander("🔧 Debug"):
-    st.write({"image_w": w, "image_h": h, "canvas_w": canvas_w, "canvas_h": canvas_h,
-              "force_resize_bg": force_resize_bg, "drawing_mode": drawing_mode})
-    st.image(bg_for_canvas, caption="Background preview (what the canvas receives)")
+    st.write({
+        "image_w": w, "image_h": h,
+        "canvas_w": canvas_w, "canvas_h": canvas_h,
+        "bg_array_shape": tuple(bg_array.shape),
+        "drawing_mode": drawing_mode, "diag_no_bg": diag_no_bg
+    })
+    st.image(bg_resized, caption="Background preview (exact array passed to canvas)")
 
-st.subheader("Draw a rectangle over the image")
+st.subheader("Draw a rectangle")
 canvas_result = st_canvas(
-    fill_color="rgba(0,0,0,0)",
+    fill_color="rgba(255,0,0,0.25)",   # visible red fill
     stroke_width=stroke_width,
-    stroke_color="#000000",
-    background_image=bg_for_canvas,   # PIL.Image in RGB, sized to canvas if forced
-    background_color="#FFFFFF",       # solid white background
+    stroke_color="#ff0000",
+    background_image=bg_array,         # <-- NumPy uint8 array, sized to canvas
+    background_color="#FFFFFF",
     update_streamlit=True,
     width=canvas_w,
     height=canvas_h,
     drawing_mode=drawing_mode,
     display_toolbar=True,
-    key=f"canvas_{w}x{h}_{int(force_resize_bg)}_{drawing_mode}",
+    key=f"canvas_{w}x{h}_{drawing_mode}_{int(diag_no_bg)}",
 )
 
 # Collect rectangles
@@ -176,7 +179,7 @@ if not rects:
 
 current_rect = rects[-1]
 
-# Map back to original image pixels (account for scaling)
+# Map rect back to original image pixels
 scale_x = w / canvas_w
 scale_y = h / canvas_h
 mapped_rect = Rect(
@@ -208,9 +211,7 @@ st.caption(
     f"Hit rate: {pct:.2f}%"
 )
 
-# =========================
-# Download selection & stats as CSV
-# =========================
+# Download CSV
 def build_stats_csv_bytes() -> bytes:
     output = io.StringIO()
     writer = csv.writer(output)
