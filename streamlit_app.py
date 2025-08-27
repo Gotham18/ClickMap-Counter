@@ -29,10 +29,6 @@ class Rect:
 # Utilities
 # =========================
 def parse_csv_points(uploaded) -> List[Point]:
-    """
-    Parses a CSV with at least two columns for X/Y.
-    Tries header-based detection (x/cx/lx/left, y/cy/ly/top), else first two columns.
-    """
     text = uploaded.getvalue().decode("utf-8-sig")
     rows = list(csv.reader(text.splitlines()))
     pts: List[Point] = []
@@ -48,28 +44,24 @@ def parse_csv_points(uploaded) -> List[Point]:
         for i, h in enumerate(header):
             if ax is None and h in hx: ax = i
             if ay is None and h in hy: ay = i
-        if ax is None or ay is None:
-            ax, ay = 0, 1
+        if ax is None or ay is None: ax, ay = 0, 1
     else:
         data = rows
         ax, ay = 0, 1
 
     for r in data:
-        if len(r) < 2:
-            continue
+        if len(r) < 2: continue
         try:
             pts.append(Point(float(r[ax]), float(r[ay])))
-        except:
+        except:  # skip bad rows
             pass
     return pts
 
 def draw_points_on_image(base_img: Image.Image, points: List[Point], normalized: bool=False) -> Image.Image:
-    """Return an image with points drawn as small circles."""
     img = base_img.copy().convert("RGBA")
     w, h = img.size
     draw = ImageDraw.Draw(img)
-    radius = max(2, int(0.006 * max(w, h)))  # appearance scaling
-
+    radius = max(2, int(0.006 * max(w, h)))
     for p in points:
         x = p.x * w if normalized else p.x
         y = p.y * h if normalized else p.y
@@ -78,19 +70,15 @@ def draw_points_on_image(base_img: Image.Image, points: List[Point], normalized:
     return img
 
 def add_grid_overlay(img: Image.Image, step_hint: int=20) -> Image.Image:
-    """Add a light grid overlay to assist with alignment."""
     w, h = img.size
     grid = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     g = ImageDraw.Draw(grid)
     step = max(50, min(w, h) // step_hint)
-    for x in range(0, w, step):
-        g.line([(x, 0), (x, h)], fill=(0, 0, 0, 40), width=1)
-    for y in range(0, h, step):
-        g.line([(0, y), (w, y)], fill=(0, 0, 0, 40), width=1)
+    for x in range(0, w, step): g.line([(x, 0), (x, h)], fill=(0, 0, 0, 40), width=1)
+    for y in range(0, h, step): g.line([(0, y), (w, y)], fill=(0, 0, 0, 40), width=1)
     return Image.alpha_composite(img, grid)
 
 def count_in_rect(points: List[Point], rect: Rect, img_w: int, img_h: int, normalized: bool=False) -> int:
-    """Counts points within the rectangle (inclusive bounds)."""
     c = 0
     for p in points:
         x = p.x * img_w if normalized else p.x
@@ -123,23 +111,22 @@ base_img = Image.open(img_file).convert("RGBA")
 w, h = base_img.size
 points = parse_csv_points(csv_file)
 
-# Optional downscale for very large images (performance)
+# Downscale very large images (perf)
 if w * h > 12_000_000:  # ~12 MP
     scale = (12_000_000 / (w * h)) ** 0.5
     base_img = base_img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
     w, h = base_img.size
 
-# Pre-render points and (optional) grid
+# Render overlay
 bg_img = draw_points_on_image(base_img, points, normalized=normalized)
 if show_grid:
     bg_img = add_grid_overlay(bg_img)
 
-# ==== Blank-canvas fix ====
-bg_np = np.array(bg_img.convert("RGB"))
+# ---- Important: pass a PIL.Image (RGB), not a NumPy array ----
+bg_img_rgb = bg_img.convert("RGB")
 
-# Compute canvas size that preserves aspect ratio and fits typical screens
-MAX_W = 1200
-MAX_H = 900
+# Canvas size preserving aspect ratio
+MAX_W, MAX_H = 1200, 900
 scale = min(MAX_W / w, MAX_H / h, 1.0)
 canvas_w = max(1, int(w * scale))
 canvas_h = max(1, int(h * scale))
@@ -149,16 +136,16 @@ canvas_result = st_canvas(
     fill_color="rgba(0,0,0,0)",
     stroke_width=stroke_width,
     stroke_color="#000000",
-    background_image=bg_np,
+    background_image=bg_img_rgb,     # <— PIL Image (truthy, no ambiguous bool)
     background_color=None,
     update_streamlit=True,
     width=canvas_w,
     height=canvas_h,
     drawing_mode="rect",
-    key=f"canvas_{w}x{h}",  # forces rerender if image size changes
+    key=f"canvas_{w}x{h}",
 )
 
-# Recover the last rectangle the user drew
+# Collect rectangles
 rects: List[Rect] = []
 if canvas_result.json_data is not None:
     for obj in canvas_result.json_data.get("objects", []):
@@ -175,7 +162,7 @@ if not rects:
 
 current_rect = rects[-1]
 
-# Map rectangle back to original image pixels (canvas may be scaled)
+# Map back to original image pixels
 scale_x = w / canvas_w
 scale_y = h / canvas_h
 mapped_rect = Rect(
@@ -185,14 +172,13 @@ mapped_rect = Rect(
     maxY=current_rect.maxY * scale_y,
 )
 
-# Compute stats
+# Stats
 count = count_in_rect(points, mapped_rect, w, h, normalized=normalized)
 rect_w = mapped_rect.maxX - mapped_rect.minX
 rect_h = mapped_rect.maxY - mapped_rect.minY
 pct = (count / max(1, len(points))) * 100
 area_pct = (rect_w * rect_h) / (w * h) * 100
 
-# Display results
 col1, col2 = st.columns(2)
 with col1:
     st.markdown(
@@ -209,7 +195,7 @@ st.caption(
 )
 
 # =========================
-# Download: selection & stats CSV
+# Download selection & stats as CSV
 # =========================
 def build_stats_csv_bytes() -> bytes:
     output = io.StringIO()
@@ -234,4 +220,3 @@ st.download_button(
     file_name="selection_stats.csv",
     mime="text/csv",
 )
-
